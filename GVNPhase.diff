@@ -1,0 +1,585 @@
+#----------------------------------------------
+Patch: Global Value Numbering (GVN) optimization
+For: DFG JIT
+From: Nare Karapetyan nare@ispras.ru
+When: 30 OCT 2012
+#----------------------------------------------
+Index: Source/JavaScriptCore/dfg/DFGVirtualRegisterAllocationPhase.cpp
+===================================================================
+--- Source/JavaScriptCore/dfg/DFGVirtualRegisterAllocationPhase.cpp	(revision 130042)
++++ Source/JavaScriptCore/dfg/DFGVirtualRegisterAllocationPhase.cpp	(working copy)
+@@ -101,8 +101,9 @@
+                 if (node.mustGenerate())
+                     scoreBoard.use(nodeIndex);
+             }
+-            scoreBoard.assertClear();
+         }
++        //FIXME MY
++        scoreBoard.assertClear();
+ #if DFG_ENABLE(DEBUG_PROPAGATION_VERBOSE)
+         if (needsNewLine)
+             dataLog("\n");
+Index: Source/JavaScriptCore/dfg/DFGSpeculativeJIT.cpp
+===================================================================
+--- Source/JavaScriptCore/dfg/DFGSpeculativeJIT.cpp	(revision 130042)
++++ Source/JavaScriptCore/dfg/DFGSpeculativeJIT.cpp	(working copy)
+@@ -1532,13 +1532,6 @@
+             checkConsistency();
+     }
+     
+-    // Perform the most basic verification that children have been used correctly.
+-#if !ASSERT_DISABLED
+-    for (unsigned index = 0; index < m_generationInfo.size(); ++index) {
+-        GenerationInfo& info = m_generationInfo[index];
+-        ASSERT(!info.alive());
+-    }
+-#endif
+ }
+ 
+ // If we are making type predictions about our arguments then
+@@ -1605,6 +1598,14 @@
+         if (block)
+             compile(*block);
+     }
++    // Perform the most basic verification that children have been used correctly.
++    // FIXME MY
++#if !ASSERT_DISABLED
++    for (unsigned index = 0; index < m_generationInfo.size(); ++index) {
++        GenerationInfo& info = m_generationInfo[index];
++        ASSERT(!info.alive());
++    }
++#endif
+     linkBranches();
+     return true;
+ }
+Index: Source/JavaScriptCore/dfg/DFGDriver.cpp
+===================================================================
+--- Source/JavaScriptCore/dfg/DFGDriver.cpp	(revision 130042)
++++ Source/JavaScriptCore/dfg/DFGDriver.cpp	(working copy)
+@@ -36,6 +36,7 @@
+ #include "DFGByteCodeParser.h"
+ #include "DFGCFAPhase.h"
+ #include "DFGCFGSimplificationPhase.h"
++#include "DFGGVNPhase.h"
+ #include "DFGCSEPhase.h"
+ #include "DFGConstantFoldingPhase.h"
+ #include "DFGFixupPhase.h"
+@@ -126,6 +127,7 @@
+         changed |= performConstantFolding(dfg);
+         changed |= performArgumentsSimplification(dfg);
+         changed |= performCFGSimplification(dfg);
++        changed |= performGVN(dfg);
+         changed |= performCSE(dfg);
+         if (!changed)
+             break;
+Index: Source/JavaScriptCore/dfg/DFGGVNPhase.h
+===================================================================
+--- Source/JavaScriptCore/dfg/DFGGVNPhase.h	(revision 0)
++++ Source/JavaScriptCore/dfg/DFGGVNPhase.h	(working copy)
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2011 Apple Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
++ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
++ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
++ */
++
++#ifndef DFGGVNPhase_h
++#define DFGGVNPhase_h
++
++#include <wtf/Platform.h>
++
++#if ENABLE(DFG_JIT)
++
++#include "DFGCommon.h"
++
++namespace JSC { namespace DFG {
++
++class Graph;
++
++// Dominator based global value numbering optimization 
++// K.D.Cooper, L.T.Simpson "Value Numbering" paper
++// Here are implemented hash table based numbering.
++
++bool performGVN(Graph&);
++
++} } // namespace JSC::DFG
++
++#endif // ENABLE(DFG_JIT)
++
++#endif // DFGGVNPhase_h
++
+Index: Source/JavaScriptCore/dfg/DFGGVNPhase.cpp
+===================================================================
+--- Source/JavaScriptCore/dfg/DFGGVNPhase.cpp	(revision 0)
++++ Source/JavaScriptCore/dfg/DFGGVNPhase.cpp	(working copy)
+@@ -0,0 +1,451 @@
++/*
++ * Copyright (C) 2011, 2012 Apple Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
++ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
++ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
++ */
++
++#include <sstream>
++#include <string>
++#include <cstdio>
++#include <locale>
++using namespace std;
++
++#include "config.h"
++#include "DFGGVNPhase.h"
++
++#if ENABLE(DFG_JIT)
++
++#include "DFGGraph.h"
++#include "DFGPhase.h"
++
++namespace JSC { namespace DFG {
++
++class GVNPhase : public Phase {
++public:
++    GVNPhase(Graph& graph)
++        : Phase(graph, "global value numbering")
++    {
++        // Replacements are used to implement global replacements.
++        m_replacements.resize(m_graph.size());
++
++        // Create Dominator tree and build immediatly dominator's set
++        m_graph.m_dominators.compute(m_graph);
++        m_graph.m_dominators.buildIDomRelation(m_graph);
++
++        m_nodeValues.resize(m_graph.size());
++        for (unsigned i = 0; i < m_graph.size(); ++i)
++            m_nodeValues[i] = NoNumber;
++
++        for (unsigned i = 0; i < m_graph.size(); ++i)
++            m_replacements[i] = NoNode;
++    }
++
++    bool run()
++    {
++        m_changed = false;
++        // Dominator based value numbering procedure - DVNT
++        performBlockGVN(0);
++        return m_changed;
++    }
++
++private:
++    static const int NoNumber = -1;
++
++    long phiNodeHashKey(NodeIndex nodeIndex)
++    {
++        stringstream phiValStreamBuff;
++        string phiValueBuff;
++        locale loc;
++        const collate<char>& coll = use_facet<collate<char> >(loc);
++
++        if(m_nodeValues[nodeIndex] != NoNumber)
++            return m_nodeValues[nodeIndex];
++
++        phiValStreamBuff << nodeIndex;
++        phiValueBuff = "@" + phiValStreamBuff.str();
++        return coll.hash(phiValueBuff.data(), phiValueBuff.data()+phiValueBuff.length());
++    }
++
++    long phiNodeHashKey(long adjacentValue, NodeIndex nodeIndex)
++    {
++        stringstream phiValStreamBuff1;
++        stringstream phiValStreamBuff2;
++        string phiValueBuff;
++        locale loc;
++        const collate<char>& coll = use_facet<collate<char> >(loc);
++        long nodeValue;
++
++        nodeValue = phiNodeHashKey(nodeIndex);
++
++        phiValStreamBuff1 << adjacentValue;
++        phiValStreamBuff2 << nodeValue;
++        phiValueBuff = phiValStreamBuff1.str() + "Phi" + phiValStreamBuff2.str();
++        return coll.hash(phiValueBuff.data(), phiValueBuff.data()+phiValueBuff.length());
++    }
++
++
++    long performPhiNodeHandling(NodeIndex phiNodeIndex, int& cnt)
++    {
++        static int cnt1 = 0;
++        static int cnt2 = 0;
++        static int cnt3 = 0;
++        long valNum = NoNumber;
++        if(cnt == 2){
++            return valNum;
++        }
++        cnt++;
++
++        Node& phiNode = m_graph[phiNodeIndex];
++
++        NodeIndex child1 = phiNode.child1().indexUnchecked();
++
++        if(child1 == NoNode || child1 == phiNodeIndex)
++            return valNum;
++
++        if(m_graph[child1].op() == Phi && m_nodeValues[child1] == NoNumber){
++            m_nodeValues[child1] = performPhiNodeHandling(child1, cnt1);
++        }
++        valNum = m_nodeValues[child1];
++        if(valNum == NoNumber)
++            valNum = phiNodeHashKey(child1);//overloaded phi node numbering function
++
++        NodeIndex child2 = phiNode.child2().indexUnchecked();
++
++        if(child2 == NoNode || child2 == phiNodeIndex)
++            return valNum;
++
++        if(m_graph[child2].op() == Phi && m_nodeValues[child2] == NoNumber){
++            m_nodeValues[child2] = performPhiNodeHandling(child2, cnt2);
++        }
++        valNum = phiNodeHashKey(valNum, child2);
++
++        NodeIndex child3 = phiNode.child3().indexUnchecked();
++
++        if(child3 == NoNode || child3 == phiNodeIndex)
++            return valNum;
++
++        if(m_graph[child3].op() == Phi && m_nodeValues[child3] == NoNumber){
++            m_nodeValues[child3] = performPhiNodeHandling(child3, cnt3);
++        }
++        valNum = phiNodeHashKey(valNum, child3);
++
++        return valNum;
++    }
++
++    void performSubstitution(Edge& child, bool addRef = true)
++    {
++        // Check if this operand is actually unused.
++        if (!child)
++            return;
++
++        // Check if there is any replacement.
++        NodeIndex replacement = m_replacements[child.index()];
++        if (replacement == NoNode)
++            return;
++
++        child.setIndex(replacement);
++
++        // There is definitely a replacement. Assert that the replacement does not
++        // have a replacement.
++        ASSERT(m_replacements[child.index()] == NoNode);
++
++        if (addRef)
++            m_graph[child].ref();
++    }
++
++    NodeIndex constantNumbering(Node& node)
++    {
++        long valNum;
++        string valBuff;
++        stringstream valStreamBuff;
++        locale loc;
++        const collate<char>& coll = use_facet<collate<char> >(loc);
++
++        valStreamBuff << node.constantNumber();
++        valBuff = valStreamBuff.str();
++        valBuff = "$" + valBuff;
++        valNum = coll.hash(valBuff.data(), valBuff.data()+valBuff.length());
++
++        m_nodeValues[m_compileIndex] = valNum;
++
++        if(!(m_table.add(valNum, m_compileIndex).isNewEntry))
++            return *(m_table.find(valNum).values());
++
++        return NoNode;
++    }
++
++    long setValueNumber(NodeIndex nodeIndex)
++    {
++        long valNum;
++        string valBuff;
++        stringstream valStreamBuff;
++        locale loc;
++        const collate<char>& coll = use_facet<collate<char> >(loc);
++
++
++        valStreamBuff << nodeIndex;
++        valBuff = valStreamBuff.str();
++        valBuff = "@" + valBuff;
++        valNum = coll.hash(valBuff.data(), valBuff.data()+valBuff.length());
++        m_nodeValues[nodeIndex] = valNum;
++        return valNum;
++    }
++
++    long setValueNumber(Node& node, string opCode)
++    {
++        NodeIndex child1 = node.child1().index();
++        NodeIndex child2 = node.child2().index();
++        long valNum;
++        string valBuff;
++        stringstream valStreamBuff1;
++        stringstream valStreamBuff2;
++        locale loc;
++        const collate<char>& coll = use_facet<collate<char> >(loc);
++
++
++        valStreamBuff1 << m_nodeValues[child1];
++        valStreamBuff2 << m_nodeValues[child2];
++        valBuff = valStreamBuff1.str() + opCode + valStreamBuff2.str();
++        valNum = coll.hash(valBuff.data(), valBuff.data()+valBuff.length());
++        m_nodeValues[m_compileIndex] = valNum;
++        return valNum;
++    }
++
++    NodeIndex nodeNumbering(Node& node, std::string opCode)
++    {
++        NodeIndex child1 = node.child1().indexUnchecked();
++
++        if (child1 == NoNode){
++            m_nodeValues[m_compileIndex] = setValueNumber(m_compileIndex);
++            return NoNode;
++        }
++
++        long valNum = m_nodeValues[child1];
++        if(valNum == NoNumber)
++            valNum = setValueNumber(child1);
++
++        NodeIndex child2 = node.child2().indexUnchecked();
++
++        if (child2 == NoNode){
++            if(!(m_table.add(valNum, m_compileIndex).isNewEntry))
++                return *(m_table.find(valNum).values());
++            return NoNode;
++        }
++
++        if(m_nodeValues[child2] == NoNumber){
++            m_nodeValues[child2] = setValueNumber(child2);
++        }
++        valNum = setValueNumber(m_graph[m_compileIndex], opCode);
++
++        NodeIndex child3 = node.child3().indexUnchecked();
++
++        if (child3 == NoNode){
++            if(!(m_table.add(valNum, m_compileIndex).isNewEntry))
++                return *(m_table.find(valNum).values());
++        }
++        return NoNode;
++    }
++
++    enum PredictionHandlingMode { RequireSamePrediction, AllowPredictionMismatch };
++
++    bool setReplacement(NodeIndex replacement, PredictionHandlingMode predictionHandlingMode = RequireSamePrediction)
++    {
++        if (replacement == NoNode)
++            return false;
++
++        if (m_graph[replacement].arithNodeFlags() != m_graph[m_compileIndex].arithNodeFlags())
++            return false ;
++
++        // Be safe. Don't try to perform replacements if the predictions don't
++        // agree.
++        if (predictionHandlingMode == RequireSamePrediction
++                && m_graph[m_compileIndex].prediction() != m_graph[replacement].prediction())
++            return false;
++
++#if DFG_ENABLE(DEBUG_PROPAGATION_VERBOSE)
++        dataLog("   Replacing @%u -> @%u", m_compileIndex, replacement);
++#endif
++
++        Node& node = m_graph[m_compileIndex];
++        node.setOpAndDefaultFlags(Phantom);
++        node.setRefCount(1);
++
++        // At this point we will eliminate all references to this node.
++        m_replacements[m_compileIndex] = replacement;
++
++        return true;
++    }
++
++    void performNodeGVN(Node& node)
++    {
++        string opCode = "";
++        bool shouldGenerate = node.shouldGenerate();
++
++        if (node.flags() & NodeHasVarArgs) {
++            for (unsigned childIdx = node.firstChild(); childIdx < node.firstChild() + node.numChildren(); childIdx++){
++                performSubstitution(m_graph.m_varArgChildren[childIdx], shouldGenerate);
++            }
++        } else {
++            for(unsigned i = 0; i < 3 ; ++i){
++                performSubstitution(node.children.child(i), shouldGenerate);
++            }
++        }
++
++        if (!shouldGenerate)
++            return;
++#if DFG_ENABLE(DEBUG_PROPAGATION_VERBOSE)
++        dataLog("   %s @%u: ", Graph::opName(m_graph[m_compileIndex].op()), m_compileIndex);
++#endif
++
++        switch(node.op()){
++
++            // /* FIXME comment this segment for make me happy
++            case JSConstant:
++               setReplacement(constantNumbering(m_graph[m_compileIndex]));
++               break;
++             // */
++
++            case SetArgument:
++            case SetLocal:
++            case GetLocal:
++                setValueNumber(m_compileIndex);
++                break;
++
++            case GetButterfly:
++                opCode = "b";
++                break;
++            case ArithAdd:
++                    opCode = "+";
++                    break;
++            case ArithSub:
++                    opCode = "-";
++                    break;
++            case ArithMul:
++                    opCode = "*";
++                    break;
++            case ArithDiv:
++                    opCode = "/";
++                    break;
++            case BitAnd:
++                    opCode = "&";
++                    break;
++            case BitOr:
++                    opCode = "|";
++                    break;
++            case BitXor:
++                    opCode = "x|";
++                    break;
++
++            default:
++                    break;
++        }
++        if(opCode != "")
++            setReplacement(nodeNumbering(m_graph[m_compileIndex], opCode));
++
++#if DFG_ENABLE(DEBUG_PROPAGATION_VERBOSE)
++        dataLog("\n");
++#endif
++    }
++
++    void adjustPhiNodeInputs()
++    {
++        for (unsigned j = 0; j < m_graph.numSuccessors(m_currentBlock); j++){
++            BlockIndex succIndex = m_graph.successor(m_currentBlock, j);
++            BasicBlock* succBlock = m_graph.m_blocks[succIndex].get();
++
++            for (size_t i = 0; i < succBlock->phis.size(); ++i) {
++                NodeIndex phiNodeIndex = succBlock->phis[i];
++                Node& phiNode = m_graph[phiNodeIndex];
++
++                bool shouldGenerate = phiNode.shouldGenerate();
++                for(unsigned k = 0; k < 3 ; ++k)
++                    performSubstitution(phiNode.children.child(k), shouldGenerate);
++            }
++        }
++    }
++
++    void cleanupScopeHashTable()
++    {
++        if (m_table.isEmpty())
++            return;
++        for (unsigned indexInBlock = 0; indexInBlock < m_currentBlock->size(); ++indexInBlock) {
++            NodeIndex tmpNodeIndex = m_currentBlock->at(indexInBlock);
++            if(m_nodeValues[tmpNodeIndex] == NoNumber)
++                continue;
++            m_table.remove(m_nodeValues[tmpNodeIndex]);
++        }
++    }
++
++    //DVNT procedure
++    void performBlockGVN(BlockIndex blockIndex)
++    {
++        m_currentBlock = m_graph.m_blocks[blockIndex].get();
++        if (!m_currentBlock)
++            return;
++        if (!m_currentBlock->isReachable)
++            return;
++
++        // perform phi node numbering
++        int cnt = 0;
++        for (size_t i = 0; i < m_currentBlock->phis.size(); ++i) {
++            NodeIndex phiNodeIndex = m_currentBlock->phis[i];
++            m_nodeValues[phiNodeIndex] = performPhiNodeHandling(phiNodeIndex, cnt);
++        }
++
++        // Perform node numbering, replacement and substitution.
++        for (m_indexInBlock = 0; m_indexInBlock < m_currentBlock->size(); ++m_indexInBlock) {
++            m_compileIndex = m_currentBlock->at(m_indexInBlock);
++            performNodeGVN(m_graph[m_compileIndex]);
++        }
++
++        // For each successor of m_currentBlock adjust phi function's inputs - perform substitution.
++        adjustPhiNodeInputs();
++
++        // Call for each child of m_ currentBlock in dominator tree performGVN() procedure.
++        for (size_t domChild = 0; domChild < m_graph.m_blocks.size(); ++domChild) {
++            if (!m_graph.m_dominators.immediatelyDominates(blockIndex, domChild))
++                continue;
++            performBlockGVN(domChild); //DVNT procedure
++        }
++
++        // Clean up hash table after leavig this scope, i.e. after leaving current branch of dominator tree.
++        cleanupScopeHashTable();
++    }
++
++    BasicBlock* m_currentBlock;
++    NodeIndex m_compileIndex;
++    unsigned m_indexInBlock;
++    Vector<NodeIndex, 16> m_replacements;
++    bool m_changed; // Only tracks changes that have a substantive effect on other optimizations.
++    HashMap< long, NodeIndex > m_table;
++    Vector<long> m_nodeValues;
++};
++
++bool performGVN(Graph& graph)
++{
++    SamplingRegion samplingRegion("DFG GVN Phase");
++    return runPhase<GVNPhase>(graph);
++}
++
++} } // namespace JSC::DFG
++
++#endif // ENABLE(DFG_JIT)

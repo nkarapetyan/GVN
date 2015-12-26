@@ -1,0 +1,16 @@
+		Patches for Webkit DFG JIT
+
+Date: Oct 2012
+Author: Nare Karapetyan
+
+Structure
+---------
+DFGIDom.diff
+GVNPhase.diff
+README
+
+Overview
+--------
+The following project contains patches for Webkit DFG JIT complier.
+DFGIDom is an implementation of immediate dominator computing algorithm.
+GVNPhase is implementation of global value numbering optimization algorithm.
